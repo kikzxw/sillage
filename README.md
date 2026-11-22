@@ -16,6 +16,15 @@ npm run deploy
 
 La commande `npm run deploy` compile l’interface, publie les pages et le Worker, et crée son Durable Object SQLite via la migration `v1`. Wrangler affiche l’adresse HTTPS finale. Si Cloudflare demande un sous-domaine `workers.dev`, définis-le dans le tableau de bord. Pour garder l’accès aux clés locales, utilise l’adresse définitive avant de créer des comptes.
 
+### Déploiement automatique depuis GitHub
+
+Dans **Workers & Pages → ton Worker → Settings → Build**, configure les commandes Workers Builds ainsi :
+
+- **Build command** : `npm run build`
+- **Deploy command** : `npx wrangler deploy`
+
+Le build crée le dossier `dist/` attendu par `wrangler.jsonc`. Sans **Build command**, le déploiement échoue avec une erreur indiquant que `dist` n’existe pas. Après avoir enregistré ces réglages, relance le build échoué ou pousse un nouveau commit.
+
 Aucune clé API ne doit être ajoutée au code. Les inscriptions sont ouvertes et limitées côté serveur. Le projet utilise une seule base SQLite Durable Object et des WebSockets. Il fonctionne sans R2, D1, base externe ou serveur à installer. Sur Cloudflare Free, les quotas de la plateforme s’appliquent.
 
 ## Tester sur ton ordinateur
