@@ -7,15 +7,16 @@ import { AccountPage, Brand, Field, HeroArt, HomePage, accountPath, chatPath } f
 import type { Account, Directory, Message, Room, Space } from './types'
 import './style.css'
 
-type Dialog = 'space' | 'room' | 'direct' | 'profile' | 'invite'
+type Dialog = 'space' | 'room' | 'direct' | 'friend' | 'profile' | 'invite'
 const dialogs: Record<Dialog, { title: string; label: string; action: string }> = {
   space: { title: 'Nouvelle communauté', label: 'Nom de la communauté', action: 'Créer' },
   room: { title: 'Nouveau salon chiffré', label: 'Nom du salon', action: 'Créer' },
+  friend: { title: 'Ajouter un ami', label: 'Pseudo de la personne', action: 'Envoyer la demande' },
   direct: { title: 'Nouveau message privé', label: 'Pseudo du destinataire', action: 'Ouvrir la conversation' },
   profile: { title: 'Mon profil', label: 'Nom d’affichage', action: 'Enregistrer' },
   invite: { title: 'Inviter dans ce salon', label: 'Pseudo du destinataire', action: 'Inviter' },
 }
-const emptyDirectory: Directory = { accounts: [], spaces: [], rooms: [], packages: 8 }
+const emptyDirectory: Directory = { accounts: [], spaces: [], rooms: [], packages: 8, friendships: [] }
 
 function currentRoute() {
   return { path: location.pathname.replace(/\/+$/, '') || '/', register: new URLSearchParams(location.search).get('mode') === 'inscription' }
@@ -62,7 +63,7 @@ function App() {
         navigate(chatPath, true)
       }}/>
   }
-  if (route.path !== chatPath || !account) return <HomePage navigate={navigate} connected={!!account}/>
+  if (route.path !== chatPath || !account) return <HomePage navigate={navigate}/>
 
   return <Chat account={account} navigate={navigate} onProfile={setAccount} onLogout={message => {
     setAccount(null)
@@ -91,6 +92,7 @@ function Chat({ account, navigate, onProfile, onLogout }: {
   const [notice, setNotice] = useState('')
   const [formError, setFormError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [responding, setResponding] = useState('')
   const [sending, setSending] = useState(false)
   const modal = useRef<HTMLDialogElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
@@ -100,6 +102,10 @@ function Chat({ account, navigate, onProfile, onLogout }: {
   const space = directory.spaces.find(item => item.id === spaceId)
   const activeRooms = directory.rooms.filter(room => room.kind === 'channel' && (space ? room.space === space.id : true))
   const directs = directory.rooms.filter(room => room.kind === 'direct')
+  const incoming = directory.friendships.filter(friend => friend.status === 'pending' && friend.recipient === account.id)
+  const outgoing = directory.friendships.filter(friend => friend.status === 'pending' && friend.sender === account.id)
+  const friends = new Set(directory.friendships.filter(friend => friend.status === 'accepted').map(friend =>
+    friend.sender === account.id ? friend.recipient : friend.sender))
   const directoryRequest = useRef<Promise<Directory> | undefined>(undefined)
 
   const refresh = useCallback(async () => {
@@ -208,12 +214,18 @@ function Chat({ account, navigate, onProfile, onLogout }: {
       } else if (dialog === 'room') {
         const created = await createRoom(account, value, 'channel', space?.id || null, directory.accounts)
         select(created.id)
+      } else if (dialog === 'friend') {
+        await post('friends/request', { user: value.toLowerCase() })
+        setNotice('Demande d’ami envoyée.')
       } else if (dialog === 'direct' || dialog === 'invite') {
         const target = directory.accounts.find(user => user.id === value.toLowerCase() && user.id !== account.id)
         if (!target) throw new Error('Ce pseudo ne correspond pas à un autre compte Sillage.')
-        const existing = dialog === 'direct' ? directs.find(room => room.owner === account.id && room.name === target.id) : selected
+        if (!friends.has(target.id)) throw new Error('Cette personne doit d’abord accepter ta demande d’ami.')
+        const existing = dialog === 'direct'
+          ? directs.find(room => (room.owner === account.id && room.name === target.id) || room.owner === target.id)
+          : selected
         const room = existing || await createRoom(account, target.id, 'direct', null, directory.accounts)
-        if (dialog === 'invite' || room.members < 2) await addMember(account, room, target, directory.accounts)
+        if (dialog === 'invite' || room.owner === account.id && room.members < 2) await addMember(account, room, target, directory.accounts)
         select(room.id)
       } else if (dialog === 'profile') {
         await post('profile', { name: value })
@@ -225,6 +237,17 @@ function Chat({ account, navigate, onProfile, onLogout }: {
       setFormError(error instanceof Error ? error.message : 'Action impossible.')
       void refresh().catch(() => {})
     } finally { setBusy(false) }
+  }
+
+  async function respond(user: string, status: 'accepted' | 'declined') {
+    if (responding) return
+    setResponding(user)
+    try {
+      await post('friends/respond', { user, status })
+      await refresh()
+      setNotice(status === 'accepted' ? 'Demande d’ami acceptée.' : 'Demande d’ami refusée.')
+    } catch (error) { report(error) }
+    finally { setResponding('') }
   }
 
   async function send(event: FormEvent) {
@@ -288,6 +311,15 @@ function Chat({ account, navigate, onProfile, onLogout }: {
         <div className="side-body">
           <div className="section-title">Salons textuels <button className="icon" aria-label="Créer un salon" onClick={() => open('room')}><Plus size={17}/></button></div>
           {activeRooms.length ? activeRooms.map(roomButton) : <p className="side-empty">Aucun salon pour le moment</p>}
+          <div className="section-title">Amis <button className="icon" aria-label="Ajouter un ami" onClick={() => open('friend')}><Plus size={17}/></button></div>
+          {incoming.map(friend => <div className="friend-request" key={friend.sender}>
+            <strong>@{friend.sender}</strong>
+            <div><button type="button" disabled={!!responding} onClick={() => void respond(friend.sender, 'accepted')}>Accepter</button>
+            <button type="button" disabled={!!responding} onClick={() => void respond(friend.sender, 'declined')}>Refuser</button></div>
+          </div>)}
+          {outgoing.map(friend => <p key={friend.recipient} className="side-empty friend-pending">@{friend.recipient} · En attente</p>)}
+          {friends.size > 0 && <p className="side-empty">{friends.size} {friends.size === 1 ? 'ami' : 'amis'}</p>}
+          {!incoming.length && !outgoing.length && !friends.size && <p className="side-empty">Ajoute un ami par son pseudo.</p>}
           <div className="section-title">Messages privés <button className="icon" aria-label="Créer un message privé" onClick={() => open('direct')}><Plus size={17}/></button></div>
           {directs.length ? directs.map(roomButton) : <p className="side-empty">Aucune conversation privée</p>}
         </div>
@@ -328,9 +360,9 @@ function Chat({ account, navigate, onProfile, onLogout }: {
           <button className="send" disabled={!roomReady || !draft.trim() || sending} aria-label="Envoyer"><Send size={17}/></button>
         </form></div>
       </> : <div className="welcome"><HeroArt/><h1>{space?.name || 'Votre espace de discussion'}</h1>
-        <p>{space ? 'Choisis un salon de la communauté ou crée-en un.' : 'Crée une communauté ou lance une conversation privée.'}</p>
+        <p>{space ? 'Choisis un salon de la communauté ou crée-en un.' : 'Ajoute des amis pour discuter en privé ou crée une communauté.'}</p>
         <div className="welcome-actions">
-          <button className="primary" onClick={() => open(space ? 'room' : 'direct')}><Plus size={17}/>{space ? 'Créer un salon' : 'Nouveau message privé'}</button>
+          <button className="primary" onClick={() => open(space ? 'room' : friends.size ? 'direct' : 'friend')}><Plus size={17}/>{space ? 'Créer un salon' : friends.size ? 'Nouveau message privé' : 'Ajouter un ami'}</button>
           {!space && <button className="secondary" onClick={() => open('space')}>Créer une communauté</button>}
         </div>
       </div>}
@@ -348,7 +380,8 @@ function Chat({ account, navigate, onProfile, onLogout }: {
         <form key={dialog} onSubmit={submit}>
           <Field name="value" label={dialogs[dialog].label} disabled={busy} maxLength={64} defaultValue={dialog === 'profile' ? account.name : undefined}/>
           {dialog === 'profile' && <p className="device-code">Clé publique de cet appareil <code>{account.identity}</code></p>}
-          {(dialog === 'invite' || dialog === 'direct') && <p>Le destinataire doit déjà avoir un compte Sillage dans son navigateur.</p>}
+          {dialog === 'friend' && <p>La personne pourra accepter ou refuser ta demande dans la section Amis.</p>}
+          {(dialog === 'invite' || dialog === 'direct') && <p>Utilise le pseudo d’un ami dont la demande a été acceptée.</p>}
           {formError && <p className="error" role="alert">{formError}</p>}
           <div className="dialog-actions">
             {dialog === 'profile' && <button type="button" className="secondary" onClick={() => void signOut()} disabled={busy}><LogOut size={16}/> Déconnexion</button>}

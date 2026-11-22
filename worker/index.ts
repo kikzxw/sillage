@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import type { Account, Directory, EventRecord, PackageRecord, Room, Space } from '../src/types'
+import type { Account, Directory, EventRecord, Friendship, PackageRecord, Room, Space } from '../src/types'
 
 interface Env { SILLAGE: DurableObjectNamespace<Sillage> }
 const encoder = new TextEncoder()
@@ -67,6 +67,12 @@ export class Sillage extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS packages_owner ON packages(owner);
       CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, owner TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS space_members (space TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(space,user));
+      CREATE TABLE IF NOT EXISTS friendships (
+        low TEXT NOT NULL, high TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+        status TEXT NOT NULL, PRIMARY KEY(low, high)
+      );
+      CREATE INDEX IF NOT EXISTS friends_sender ON friendships(sender);
+      CREATE INDEX IF NOT EXISTS friends_recipient ON friendships(recipient);
       CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, space TEXT, owner TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS members (room TEXT NOT NULL, user TEXT NOT NULL, joined INTEGER NOT NULL, welcome TEXT, packageId TEXT, PRIMARY KEY(room,user));
       CREATE INDEX IF NOT EXISTS members_user ON members(user);
@@ -82,6 +88,13 @@ export class Sillage extends DurableObject<Env> {
         expires=CASE WHEN expires<=? THEN excluded.expires ELSE expires END RETURNING hits`,
       bucket, now + 15 * 60_000, now, now).one()
     if (hit.hits > quota) throw new RequestError('Trop de tentatives. Réessaie dans quelques minutes.', 429)
+  }
+  private friendship(a: string, b: string) {
+    const [low, high] = [a, b].sort()
+    return this.sql.exec<Friendship>('SELECT sender,recipient,status FROM friendships WHERE low=? AND high=?', low, high).toArray()[0]
+  }
+  private requireFriend(a: string, b: string) {
+    if (this.friendship(a, b)?.status !== 'accepted') throw new RequestError('Une demande d’ami doit être acceptée avant de continuer.', 403)
   }
   private member(room: string, user: string) {
     const row = this.sql.exec<{ joined: number }>('SELECT joined FROM members WHERE room=? AND user=?', room, user).toArray()[0]
@@ -177,11 +190,45 @@ export class Sillage extends DurableObject<Env> {
         pair[1].serializeAttachment(tokenHash)
         return new Response(null, { status: 101, webSocket: pair[0] })
       }
+      if (path === '/api/friends/request' && method === 'POST') {
+        const target = text((await readJson()).user, 31, username)
+        if (target === me.id || !this.sql.exec('SELECT 1 FROM accounts WHERE id=?', target).toArray().length) throw new RequestError('Ce pseudo ne correspond pas à un autre compte Sillage.', 404)
+        this.limit('friends:' + me.id, 20)
+        const existing = this.friendship(me.id, target)
+        if (existing?.status === 'accepted') return json(true)
+        if (existing?.status === 'pending') throw new RequestError('Une demande est déjà en attente.', 409)
+        if (existing?.status === 'declined' && existing.sender === me.id) throw new RequestError('Cette personne a refusé la demande.', 409)
+        const [low, high] = [me.id, target].sort()
+        this.sql.exec(`INSERT INTO friendships VALUES(?,?,?,?,'pending') ON CONFLICT(low,high)
+          DO UPDATE SET sender=excluded.sender,recipient=excluded.recipient,status='pending'`, low, high, me.id, target)
+        this.notify([me.id, target])
+        return json(true)
+      }
+      if (path === '/api/friends/respond' && method === 'POST') {
+        const form = await readJson()
+        const sender = text(form.user, 31, username)
+        const status = text(form.status, 8, /^(accepted|declined)$/)
+        const updated = this.sql.exec(`UPDATE friendships SET status=?
+          WHERE sender=? AND recipient=? AND status='pending' RETURNING sender`, status, sender, me.id).toArray()
+        if (!updated.length && !this.sql.exec('SELECT 1 FROM friendships WHERE sender=? AND recipient=? AND status=?', sender, me.id, status).toArray().length) throw new RequestError('Aucune demande reçue de cette personne.', 403)
+        this.notify([me.id, sender])
+        return json(true)
+      }
       if (path === '/api/directory' && method === 'GET') {
         const value: Directory = {
           accounts: this.sql.exec<Account>('SELECT id,name,identity FROM accounts ORDER BY id LIMIT 500').toArray(),
           spaces: this.sql.exec<Space>('SELECT id,name,owner FROM spaces JOIN space_members ON id=space WHERE user=? ORDER BY name', me.id).toArray(),
-          rooms: this.sql.exec<Room>('SELECT id,name,kind,space,owner,joined,welcome,packageId,(SELECT count(*) FROM members AS others WHERE others.room=rooms.id) AS members FROM rooms JOIN members ON id=room WHERE user=? ORDER BY name', me.id).toArray(),
+          rooms: this.sql.exec<Room>(`SELECT id,name,kind,space,owner,joined,welcome,packageId,
+            (SELECT count(*) FROM members AS others WHERE others.room=rooms.id) AS members
+            FROM rooms JOIN members ON id=room WHERE user=? AND (
+              (kind='channel' AND owner=user) OR EXISTS (
+                SELECT 1 FROM friendships WHERE status='accepted'
+                  AND low=min(owner,CASE WHEN kind='direct' THEN name ELSE user END)
+                  AND high=max(owner,CASE WHEN kind='direct' THEN name ELSE user END)
+              )
+            ) ORDER BY name`, me.id).toArray(),
+          friendships: this.sql.exec<Friendship>(`SELECT sender,recipient,status FROM friendships
+            WHERE (sender=? OR recipient=?) AND status!='declined'`, me.id, me.id).toArray(),
           packages: this.sql.exec<{ n: number }>('SELECT count(*) AS n FROM packages WHERE owner=? AND expires>?', me.id, Date.now()).one().n,
         }
         return json(value)
@@ -200,6 +247,7 @@ export class Sillage extends DurableObject<Env> {
       }
       if (path.startsWith('/api/packages/') && method === 'GET') {
         const user = text(path.split('/')[3], 31, username)
+        this.requireFriend(me.id, user)
         const pkg = this.sql.exec<PackageRecord>('SELECT id,data FROM packages WHERE owner=? AND expires>? LIMIT 1', user, Date.now()).toArray()[0]
         if (!pkg) throw new RequestError('Cette personne doit ouvrir Sillage pour publier de nouvelles clés.', 409)
         return json(pkg)
@@ -219,6 +267,7 @@ export class Sillage extends DurableObject<Env> {
         const room = id(form.id)
         const name = text(form.name, 64)
         const kind = text(form.kind, 7, /^(channel|direct)$/)
+        if (kind === 'direct') this.requireFriend(me.id, text(name, 31, username))
         const space = form.space == null ? null : id(form.space)
         if ((space && kind === 'direct') || (space && !this.sql.exec('SELECT 1 FROM space_members WHERE space=? AND user=?', space, me.id).toArray().length)) throw new RequestError('Communauté inaccessible.', 403)
         this.ctx.storage.transactionSync(() => {
@@ -235,6 +284,18 @@ export class Sillage extends DurableObject<Env> {
       if (route) {
         const room = id(route[1])
         const membership = this.member(room, me.id)
+        const info = this.sql.exec<Pick<Room, 'owner' | 'kind' | 'space' | 'name'>>(
+          'SELECT owner,kind,space,name FROM rooms WHERE id=?', room).one()
+        if (info.kind === 'direct') {
+          if (me.id !== info.owner && me.id !== info.name) throw new RequestError('Conversation inaccessible.', 403)
+          this.requireFriend(info.owner, info.name)
+          if (route[2] !== 'invite' && (method !== 'GET' || route[2] === 'files') &&
+              !this.sql.exec('SELECT 1 FROM members WHERE room=? AND user=?', room, info.name).toArray().length) {
+            throw new RequestError('La conversation n’est pas encore prête.', 403)
+          }
+        } else if (me.id !== info.owner) {
+          this.requireFriend(info.owner, me.id)
+        }
         if (route[2] === 'events' && method === 'GET') {
           const after = Number(url.searchParams.get('after') || 0)
           if (!Number.isSafeInteger(after) || after < 0) throw new RequestError('Position invalide.')
@@ -251,7 +312,8 @@ export class Sillage extends DurableObject<Env> {
           const target = text(form.user, 31, username)
           const pack = id(form.packageId)
           const welcome = text(form.welcome, 50000, base64)
-          const info = this.sql.exec<Room>('SELECT owner,kind,space FROM rooms WHERE id=?', room).one()
+          this.requireFriend(me.id, target)
+          if (info.kind === 'direct' && target !== info.name) throw new RequestError('Ce compte ne correspond pas au destinataire.', 403)
           if (info.owner !== me.id) throw new RequestError('Seul le créateur peut inviter.', 403)
           const result = this.ctx.storage.transactionSync(() => {
             const prior = this.sql.exec<EventRecord>('SELECT id,seq,sender,at,data FROM events WHERE room=? AND id=?', room, id(form.id)).toArray()[0]

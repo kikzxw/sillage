@@ -32,11 +32,10 @@ export function HeroArt() {
   </div>
 }
 
-export function HomePage({ navigate, connected }: { navigate: Navigate; connected: boolean }) {
+export function HomePage({ navigate }: { navigate: Navigate }) {
   return <div className="public-page">
     <header className="public-header">
-      <Brand navigate={navigate}/>
-      <nav aria-label="Compte"><RouteLink className="secondary" href={connected ? chatPath : accountPath} navigate={navigate}>{connected ? 'Messagerie' : 'Connexion'}</RouteLink></nav>
+      <span className="brand"><span className="brand-icon"><AudioLines size={21}/></span>Sillage</span>
     </header>
     <main className="landing">
       <div className="landing-hero">
@@ -45,8 +44,7 @@ export function HomePage({ navigate, connected }: { navigate: Navigate; connecte
         <h1>Retrouve tes communautés.<br/><span>Discute en privé.</span></h1>
         <p>Des salons pour te retrouver en groupe, et des messages privés chiffrés de bout en bout.</p>
         <div className="welcome-actions">
-          <RouteLink className="primary" href={connected ? chatPath : registerPath} navigate={navigate}>{connected ? 'Ouvrir la messagerie' : 'Créer un compte'}</RouteLink>
-          {!connected && <RouteLink className="secondary" href={accountPath} navigate={navigate}>Se connecter</RouteLink>}
+          <RouteLink className="primary" href={accountPath} navigate={navigate}>Commencer</RouteLink>
         </div>
       </div>
       <section className="landing-features" aria-label="Fonctionnalités">
@@ -109,8 +107,8 @@ export function AccountPage({ navigate, register, connected, notice, onAuthentic
         <span className="security-icon"><Hash size={21}/></span>
         <h2>Comment créer ton compte</h2>
         <ol>
-          <li><div><strong>Choisis « Inscription »</strong><p>Entre un pseudo, par exemple <code>alice_27</code>. Les autres membres pourront t’inviter en utilisant ce pseudo.</p></div></li>
-          <li><div><strong>Crée ton mot de passe</strong><p>Utilise au moins 12 caractères, puis clique sur « Créer mon compte ». La messagerie s’ouvre dès que ton compte est prêt.</p></div></li>
+          <li><div><strong>Choisis « Inscription »</strong><p>Entre un pseudo, par exemple <code>alice_27</code>. Les autres membres pourront t’envoyer une demande d’ami avec ce pseudo.</p></div></li>
+          <li><div><strong>Crée ton mot de passe</strong><p>Utilise au moins 12 caractères, puis clique sur « Créer mon compte ». Dans la messagerie, ajoute un ami par son pseudo et attends qu’il accepte avant de lui écrire.</p></div></li>
           <li><div><strong>Reviens avec le même navigateur</strong><p>Les clés qui ouvrent tes conversations restent sur cet appareil. Évite la navigation privée et conserve les données du site.</p></div></li>
         </ol>
         <details><summary>Je change de navigateur ou d’appareil</summary><p>Ce prototype associe un compte à un seul navigateur. Il ne permet pas de déplacer les clés ni de récupérer les conversations après effacement des données locales.</p></details>

@@ -35,7 +35,7 @@ npm run build
 npm run dev
 ```
 
-Ouvre l’adresse indiquée par Wrangler. Pour échanger des messages, crée deux comptes dans deux profils de navigateur séparés et ouvre une conversation privée avec le pseudo du deuxième compte. Chaque compte utilise son propre stockage de clés. Une invitation à un salon ajoute aussi le destinataire à sa communauté. Les salons peuvent accueillir jusqu’à 24 personnes.
+Ouvre l’adresse indiquée par Wrangler. Pour échanger des messages, crée deux comptes dans deux profils de navigateur séparés. Dans **Amis**, envoie une demande avec le pseudo du deuxième compte et accepte-la depuis ce compte. Tu peux ensuite ouvrir une conversation privée. Les invitations à un salon suivent la même règle et ajoutent aussi le destinataire à la communauté. Une conversation antérieure redevient accessible après acceptation de la demande. Les salons peuvent accueillir jusqu’à 24 personnes.
 
 ## Sécurité et limites actuelles
 
