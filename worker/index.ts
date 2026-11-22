@@ -108,6 +108,20 @@ export class Sillage extends DurableObject<Env> {
       }
     }
   }
+  private friendIds(user: string) {
+    return this.sql.exec<{ id: string }>(`SELECT CASE WHEN sender=? THEN recipient ELSE sender END AS id
+      FROM friendships WHERE (sender=? OR recipient=?) AND status='accepted'`, user, user, user)
+      .toArray().map(friend => friend.id)
+  }
+  private online(user: string, excluding?: WebSocket) {
+    return this.ctx.getWebSockets(user).some(socket => socket !== excluding && socket.readyState === WebSocket.OPEN)
+  }
+  webSocketClose(socket: WebSocket) {
+    const [user] = this.ctx.getTags(socket)
+    if (user && !this.online(user, socket)) this.notify(this.friendIds(user))
+    if (socket.readyState === WebSocket.CLOSING) socket.close()
+  }
+
   private users(room: string) {
     return this.sql.exec<{ user: string }>('SELECT user FROM members WHERE room=?', room).toArray().map(row => row.user)
   }
@@ -185,9 +199,11 @@ export class Sillage extends DurableObject<Env> {
       }
       if (path === '/api/live' && method === 'GET' && req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
         if (this.ctx.getWebSockets(me.id).length >= 8) throw new RequestError('Trop de connexions simultanées.', 429)
+        const wasOnline = this.online(me.id)
         const pair = new WebSocketPair()
         this.ctx.acceptWebSocket(pair[1], [me.id])
         pair[1].serializeAttachment(tokenHash)
+        if (!wasOnline) this.notify(this.friendIds(me.id))
         return new Response(null, { status: 101, webSocket: pair[0] })
       }
       if (path === '/api/friends/request' && method === 'POST') {
@@ -229,6 +245,7 @@ export class Sillage extends DurableObject<Env> {
             ) ORDER BY name`, me.id).toArray(),
           friendships: this.sql.exec<Friendship>(`SELECT sender,recipient,status FROM friendships
             WHERE (sender=? OR recipient=?) AND status!='declined'`, me.id, me.id).toArray(),
+          onlineFriends: this.friendIds(me.id).filter(friend => this.online(friend)),
           packages: this.sql.exec<{ n: number }>('SELECT count(*) AS n FROM packages WHERE owner=? AND expires>?', me.id, Date.now()).one().n,
         }
         return json(value)

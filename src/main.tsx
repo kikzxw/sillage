@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Command, Download, Hash, LockKeyhole, LogOut, Menu, MessageSquare, Paperclip, Plus, Send, Settings2, ShieldCheck, Users, X } from 'lucide-react'
+import { Command, Download, Hash, LockKeyhole, LogOut, Menu, MessageSquare, Paperclip, Plus, Search, Send, Settings2, ShieldCheck, Users, X } from 'lucide-react'
 import { ApiError, post, request } from './api'
 import { addMember, createRoom, downloadFile, loadIdentity, readMessages, replenish, sendMessage, uploadFile } from './crypto'
 import { AccountPage, Brand, Field, HeroArt, HomePage, accountPath, chatPath } from './pages'
@@ -16,7 +16,7 @@ const dialogs: Record<Dialog, { title: string; label: string; action: string }> 
   profile: { title: 'Mon profil', label: 'Nom d’affichage', action: 'Enregistrer' },
   invite: { title: 'Inviter dans ce salon', label: 'Pseudo du destinataire', action: 'Inviter' },
 }
-const emptyDirectory: Directory = { accounts: [], spaces: [], rooms: [], packages: 8, friendships: [] }
+const emptyDirectory: Directory = { accounts: [], spaces: [], rooms: [], packages: 8, friendships: [], onlineFriends: [] }
 
 function currentRoute() {
   return { path: location.pathname.replace(/\/+$/, '') || '/', register: new URLSearchParams(location.search).get('mode') === 'inscription' }
@@ -79,6 +79,10 @@ function Chat({ account, navigate, onProfile, onLogout }: {
   onLogout: (message: string) => void
 }) {
   const [directory, setDirectory] = useState(emptyDirectory)
+  const [friendView, setFriendView] = useState<'all' | 'online' | 'pending'>('all')
+  const [friendSearch, setFriendSearch] = useState('')
+  const [dmSearch, setDmSearch] = useState('')
+  const [opening, setOpening] = useState('')
   const [roomId, setRoomId] = useState('')
   const [spaceId, setSpaceId] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
@@ -100,16 +104,34 @@ function Chat({ account, navigate, onProfile, onLogout }: {
   const currentRoom = useRef('')
   const selected = directory.rooms.find(room => room.id === roomId)
   const space = directory.spaces.find(item => item.id === spaceId)
-  const activeRooms = directory.rooms.filter(room => room.kind === 'channel' && (space ? room.space === space.id : true))
+  const personal = !spaceId
+  const standalone = directory.rooms.filter(room => room.kind === 'channel' && room.space === null)
+  const activeRooms = spaceId === 'standalone' ? standalone : directory.rooms.filter(room => room.kind === 'channel' && room.space === spaceId)
+  const spaceName = space?.name || (spaceId === 'standalone' ? 'Salons indépendants' : 'Mon espace')
   const directs = directory.rooms.filter(room => room.kind === 'direct')
   const incoming = directory.friendships.filter(friend => friend.status === 'pending' && friend.recipient === account.id)
   const outgoing = directory.friendships.filter(friend => friend.status === 'pending' && friend.sender === account.id)
   const friends = new Set(directory.friendships.filter(friend => friend.status === 'accepted').map(friend =>
     friend.sender === account.id ? friend.recipient : friend.sender))
+  const online = new Set(directory.onlineFriends)
+  const accounts = new Map(directory.accounts.map(user => [user.id, user]))
+  const friendName = (user: string) => accounts.get(user)?.name || user
+  const matches = (user: string, query: string) =>
+    (user + ' ' + friendName(user)).toLocaleLowerCase('fr').includes(query.trim().toLocaleLowerCase('fr').replace(/^@/, ''))
+  const visibleFriends = [...friends].filter(user => (friendView !== 'online' || online.has(user)) && matches(user, friendSearch))
+    .sort((a, b) => friendName(a).localeCompare(friendName(b), 'fr'))
+  const visibleDirects = directs.filter(room => matches(room.owner === account.id ? room.name : room.owner, dmSearch))
+  const pendingIncoming = incoming.filter(item => matches(item.sender, friendSearch))
+  const pendingOutgoing = outgoing.filter(item => matches(item.recipient, friendSearch))
+  const incomingCount = incoming.length
+  const friendsPage = personal && !selected
   const directoryRequest = useRef<Promise<Directory> | undefined>(undefined)
 
-  const refresh = useCallback(async () => {
-    if (directoryRequest.current) return directoryRequest.current
+  const refresh = useCallback(async (fresh = false) => {
+    const previous = directoryRequest.current
+    if (previous && !fresh) return previous
+    if (previous) await previous.catch(() => {})
+    if (directoryRequest.current && directoryRequest.current !== previous) return directoryRequest.current
     const operation = request<Directory>('directory')
     directoryRequest.current = operation
     try {
@@ -138,7 +160,9 @@ function Chat({ account, navigate, onProfile, onLogout }: {
       if (stopped) return
       socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/live')
       socket.onopen = () => { setLive(true); update() }
-      socket.onmessage = update
+      socket.onmessage = () => {
+        void refresh(true).then(next => replenish(account, next.packages)).catch(error => { if (!stopped) report(error) })
+      }
       socket.onclose = () => {
         if (stopped) return
         setLive(false)
@@ -199,6 +223,25 @@ function Chat({ account, navigate, onProfile, onLogout }: {
     setDialog(target)
   }
 
+  async function openConversation(target: Account) {
+    if (!friends.has(target.id)) throw new Error('Cette personne doit d’abord accepter ta demande d’ami.')
+    const existing = directs.find(room => (room.owner === account.id && room.name === target.id) || room.owner === target.id)
+    const room = existing || await createRoom(account, target.id, 'direct', null, directory.accounts)
+    if (room.owner === account.id && room.members < 2) await addMember(account, room, target, directory.accounts)
+    setSpaceId('')
+    select(room.id)
+  }
+
+  async function messageFriend(user: string) {
+    const target = accounts.get(user)
+    if (!target || opening) return
+    setOpening(user)
+    setNotice('')
+    try { await openConversation(target); await refresh(true) }
+    catch (error) { report(error); void refresh(true).catch(() => {}) }
+    finally { setOpening('') }
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (busy) return
@@ -212,30 +255,35 @@ function Chat({ account, navigate, onProfile, onLogout }: {
         setSpaceId(created.id)
         select('')
       } else if (dialog === 'room') {
-        const created = await createRoom(account, value, 'channel', space?.id || null, directory.accounts)
+        if (!space) throw new Error('Choisis une communauté pour créer un salon.')
+        const created = await createRoom(account, value, 'channel', space.id, directory.accounts)
         select(created.id)
       } else if (dialog === 'friend') {
         await post('friends/request', { user: value.toLowerCase() })
+        setFriendView('pending')
+        setFriendSearch('')
+        setSpaceId('')
+        select('')
         setNotice('Demande d’ami envoyée.')
       } else if (dialog === 'direct' || dialog === 'invite') {
         const target = directory.accounts.find(user => user.id === value.toLowerCase() && user.id !== account.id)
         if (!target) throw new Error('Ce pseudo ne correspond pas à un autre compte Sillage.')
         if (!friends.has(target.id)) throw new Error('Cette personne doit d’abord accepter ta demande d’ami.')
-        const existing = dialog === 'direct'
-          ? directs.find(room => (room.owner === account.id && room.name === target.id) || room.owner === target.id)
-          : selected
-        const room = existing || await createRoom(account, target.id, 'direct', null, directory.accounts)
-        if (dialog === 'invite' || room.owner === account.id && room.members < 2) await addMember(account, room, target, directory.accounts)
-        select(room.id)
+        if (dialog === 'direct') {
+          await openConversation(target)
+        } else {
+          if (!selected || selected.kind !== 'channel') throw new Error('Choisis le salon à partager.')
+          await addMember(account, selected, target, directory.accounts)
+        }
       } else if (dialog === 'profile') {
         await post('profile', { name: value })
         onProfile({ ...account, name: value })
       }
-      await refresh()
+      await refresh(true)
       setDialog(undefined)
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Action impossible.')
-      void refresh().catch(() => {})
+      void refresh(true).catch(() => {})
     } finally { setBusy(false) }
   }
 
@@ -244,7 +292,7 @@ function Chat({ account, navigate, onProfile, onLogout }: {
     setResponding(user)
     try {
       await post('friends/respond', { user, status })
-      await refresh()
+      await refresh(true)
       setNotice(status === 'accepted' ? 'Demande d’ami acceptée.' : 'Demande d’ami refusée.')
     } catch (error) { report(error) }
     finally { setResponding('') }
@@ -300,28 +348,36 @@ function Chat({ account, navigate, onProfile, onLogout }: {
     {sidebar && <button className="scrim" onClick={() => setSidebar(false)} aria-label="Fermer la navigation"/>}
     <div className={'navigation ' + (sidebar ? 'nav-open' : '')}>
       <nav className="rail" aria-label="Communautés">
-        <button title="Tous les salons" aria-label="Tous les salons" className={'rail-button ' + (!spaceId ? 'active' : '')} onClick={() => { setSpaceId(''); select('') }}><Command size={21}/></button>
+        <button title="Mon espace" aria-label="Mon espace" className={'rail-button ' + (!spaceId ? 'active' : '')} onClick={() => { setSpaceId(''); select('') }}><Command size={21}/></button>
         <div className="rail-line"/>
+        {standalone.length > 0 && <button title="Salons indépendants" aria-label="Salons indépendants"
+          className={'rail-button ' + (spaceId === 'standalone' ? 'active' : '')}
+          onClick={() => { setSpaceId('standalone'); select('') }}><Hash size={20}/></button>}
         {directory.spaces.map(item => <button key={item.id} title={item.name} className={'rail-button ' + (item.id === spaceId ? 'active' : '')}
           onClick={() => { setSpaceId(item.id); select('') }}>{initials(item.name)}</button>)}
         <button className="rail-button dashed" aria-label="Créer une communauté" title="Créer une communauté" onClick={() => open('space')}><Plus size={22}/></button>
       </nav>
       <aside className="sidebar">
-        <div className="side-title"><span><strong>{space?.name || 'Mon espace'}</strong><small>{space ? 'Communauté Sillage' : 'Messagerie Sillage'}</small></span></div>
+        <div className="side-title"><span><strong>{spaceName}</strong></span></div>
         <div className="side-body">
-          <div className="section-title">Salons textuels <button className="icon" aria-label="Créer un salon" onClick={() => open('room')}><Plus size={17}/></button></div>
-          {activeRooms.length ? activeRooms.map(roomButton) : <p className="side-empty">Aucun salon pour le moment</p>}
-          <div className="section-title">Amis <button className="icon" aria-label="Ajouter un ami" onClick={() => open('friend')}><Plus size={17}/></button></div>
-          {incoming.map(friend => <div className="friend-request" key={friend.sender}>
-            <strong>@{friend.sender}</strong>
-            <div><button type="button" disabled={!!responding} onClick={() => void respond(friend.sender, 'accepted')}>Accepter</button>
-            <button type="button" disabled={!!responding} onClick={() => void respond(friend.sender, 'declined')}>Refuser</button></div>
-          </div>)}
-          {outgoing.map(friend => <p key={friend.recipient} className="side-empty friend-pending">@{friend.recipient} · En attente</p>)}
-          {friends.size > 0 && <p className="side-empty">{friends.size} {friends.size === 1 ? 'ami' : 'amis'}</p>}
-          {!incoming.length && !outgoing.length && !friends.size && <p className="side-empty">Ajoute un ami par son pseudo.</p>}
-          <div className="section-title">Messages privés <button className="icon" aria-label="Créer un message privé" onClick={() => open('direct')}><Plus size={17}/></button></div>
-          {directs.length ? directs.map(roomButton) : <p className="side-empty">Aucune conversation privée</p>}
+          {personal ? <>
+            <button className={'channel friend-nav ' + (friendsPage ? 'selected' : '')}
+              aria-current={friendsPage ? 'page' : undefined} onClick={() => select('')}>
+              <Users size={18}/><span>Amis</span>{incomingCount > 0 && <b className="friend-count">{incomingCount}</b>}
+            </button>
+            <label className="friend-search dm-search"><Search size={16}/>
+              <input aria-label="Rechercher une conversation" placeholder="Rechercher un message privé" value={dmSearch} onChange={event => setDmSearch(event.target.value)}/>
+            </label>
+            <div className="section-title">Messages privés <button className="icon" aria-label="Nouveau message privé"
+              onClick={() => open(friends.size ? 'direct' : 'friend')}><Plus size={17}/></button></div>
+            {visibleDirects.map(roomButton)}
+            {directs.length === 0 && <p className="side-empty">Aucune conversation privée</p>}
+            {directs.length > 0 && visibleDirects.length === 0 &&
+              <p className="side-empty">Aucune conversation trouvée</p>}
+          </> : <>
+            <div className="section-title">Salons textuels {space && <button className="icon" aria-label="Créer un salon" onClick={() => open('room')}><Plus size={17}/></button>}</div>
+            {activeRooms.length ? activeRooms.map(roomButton) : <p className="side-empty">Aucun salon pour le moment</p>}
+          </>}
         </div>
         <div className="profile"><span className="avatar">{initials(account.name)}</span><div><strong>{account.name}</strong><small>@{account.id}</small></div>
           <button className="icon" aria-label="Profil et déconnexion" onClick={() => open('profile')}><Settings2 size={18}/></button></div>
@@ -329,14 +385,52 @@ function Chat({ account, navigate, onProfile, onLogout }: {
     </div>
 
     <main className="main">
-      <div className="room-header"><span className="room-icon">{selected ? <Hash size={21}/> : <MessageSquare size={18}/>}</span>
-        <div className="room-heading"><strong>{selected ? roomName(selected) : space?.name || 'Accueil'}</strong><small>{selected ? 'Salon chiffré' : 'Espace de messagerie'}</small></div>
+      <div className="room-header"><span className="room-icon">{selected?.kind === 'channel' ? <Hash size={21}/> : friendsPage ? <Users size={19}/> : <MessageSquare size={18}/>}</span>
+        <div className="room-heading"><strong>{selected ? roomName(selected) : friendsPage ? 'Amis' : spaceName}</strong><small>{selected ? 'Conversation chiffrée' : friendsPage ? 'Mon espace' : 'Salons textuels'}</small></div>
         {selected?.kind === 'channel' && selected.owner === account.id &&
           <button className="icon" title="Inviter" aria-label="Inviter" onClick={() => open('invite')}><Users size={18}/></button>}
-        <button className={'icon info-toggle ' + (details ? 'on' : '')} aria-label="Confidentialité" onClick={() => { setDetails(!details); setMobileDetails(!mobileDetails) }}><ShieldCheck size={20}/></button>
+        {selected?.kind === 'direct' && <button className="icon return-friends" aria-label="Retour aux amis" title="Retour aux amis" onClick={() => select('')}><Users size={18}/></button>}
+        {friendsPage && <button className="primary friend-add" onClick={() => open('friend')}><Plus size={17}/> Ajouter un ami</button>}
+        {!friendsPage && <button className={'icon info-toggle ' + (details ? 'on' : '')} aria-label="Confidentialité" onClick={() => { setDetails(!details); setMobileDetails(!mobileDetails) }}><ShieldCheck size={20}/></button>}
       </div>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button className="icon" aria-label="Fermer le message" onClick={() => setNotice('')}><X size={16}/></button></div>}
-      {selected ? <>
+      {friendsPage ? <section className="friends-workspace" aria-label="Liste d’amis">
+        <div className="friend-filters" role="group" aria-label="Filtrer les amis">
+          {(['all', 'online', 'pending'] as const).map(view => <button key={view} aria-pressed={friendView === view}
+            onClick={() => { setFriendView(view); setFriendSearch('') }}>
+            {view === 'all' ? 'Tous' : view === 'online' ? 'En ligne' : 'Demandes'}
+            {view === 'pending' && incomingCount > 0 && <b className="friend-count">{incomingCount}</b>}
+          </button>)}
+        </div>
+        <label className="friend-search friend-find"><Search size={19}/><input aria-label={friendView === 'pending' ? 'Rechercher une demande' : 'Rechercher un ami'}
+          placeholder={friendView === 'pending' ? 'Rechercher une demande' : 'Rechercher par nom ou pseudo'}
+          value={friendSearch} onChange={event => setFriendSearch(event.target.value)}/></label>
+        {friendView === 'pending' ? <>
+          <h2>Demandes reçues <span>{pendingIncoming.length}</span></h2>
+          {pendingIncoming.length === 0 && <p className="friends-empty">Aucune demande reçue.</p>}
+          {pendingIncoming.map(item => <div className="friend-row" key={item.sender}>
+            <FriendIdentity user={item.sender} name={friendName(item.sender)}/>
+            <div className="friend-actions">
+              <button className="secondary" disabled={!!responding} onClick={() => void respond(item.sender, 'accepted')}>Accepter</button>
+              <button className="icon" aria-label={'Refuser la demande de ' + item.sender} title="Refuser" disabled={!!responding} onClick={() => void respond(item.sender, 'declined')}><X size={18}/></button>
+            </div>
+          </div>)}
+          <h2>Demandes envoyées <span>{pendingOutgoing.length}</span></h2>
+          {pendingOutgoing.length === 0 && <p className="friends-empty">Aucune demande envoyée.</p>}
+          {pendingOutgoing.map(item => <div className="friend-row" key={item.recipient}>
+            <FriendIdentity user={item.recipient} name={friendName(item.recipient)}/>
+            <span className="friend-waiting">En attente</span>
+          </div>)}
+        </> : <>
+          <h2>{friendView === 'online' ? 'Amis en ligne' : 'Tous tes amis'} <span>{visibleFriends.length}</span></h2>
+          {visibleFriends.length === 0 && <p className="friends-empty">{friendSearch.trim() ? 'Aucun résultat.' : friendView === 'online' ? 'Aucun ami en ligne pour le moment.' : 'Ajoute un ami par son pseudo pour commencer.'}</p>}
+          {visibleFriends.map(user => <div className="friend-row" key={user}>
+            <FriendIdentity user={user} name={friendName(user)} online={online.has(user)}/>
+            <button className="icon friend-message" aria-label={'Écrire à ' + user} title="Ouvrir le message privé" disabled={!!opening}
+              onClick={() => void messageFriend(user)}><MessageSquare size={19}/></button>
+          </div>)}
+        </>}
+      </section> : selected ? <>
         <div className="messages" aria-busy={!roomReady}>
           {!messages.length && <div className="empty-messages"><MessageSquare size={30}/><p>{roomReady ? 'Aucun message dans ce salon.' : 'Synchronisation du salon chiffré…'}</p></div>}
           {messages.map(message => {
@@ -359,22 +453,19 @@ function Chat({ account, navigate, onProfile, onLogout }: {
           <input aria-label="Message" placeholder={'Écrire dans ' + roomName(selected)} value={draft} maxLength={4000} onChange={event => setDraft(event.target.value)} disabled={!roomReady}/>
           <button className="send" disabled={!roomReady || !draft.trim() || sending} aria-label="Envoyer"><Send size={17}/></button>
         </form></div>
-      </> : <div className="welcome"><HeroArt/><h1>{space?.name || 'Votre espace de discussion'}</h1>
-        <p>{space ? 'Choisis un salon de la communauté ou crée-en un.' : 'Ajoute des amis pour discuter en privé ou crée une communauté.'}</p>
-        <div className="welcome-actions">
-          <button className="primary" onClick={() => open(space ? 'room' : friends.size ? 'direct' : 'friend')}><Plus size={17}/>{space ? 'Créer un salon' : friends.size ? 'Nouveau message privé' : 'Ajouter un ami'}</button>
-          {!space && <button className="secondary" onClick={() => open('space')}>Créer une communauté</button>}
-        </div>
+      </> : <div className="welcome"><HeroArt/><h1>{spaceName}</h1>
+        <p>Choisis un salon dans la barre latérale.</p>
+        {space && <button className="primary" onClick={() => open('room')}><Plus size={17}/> Créer un salon</button>}
       </div>}
     </main>
-    <aside className={'details ' + (details ? '' : 'details-hidden ') + (mobileDetails ? 'details-open' : '')}>
+    {!friendsPage && <aside className={'details ' + (details ? '' : 'details-hidden ') + (mobileDetails ? 'details-open' : '')}>
       <div className="details-title"><ShieldCheck size={18}/> Confidentialité<button className="icon mobile-close" aria-label="Fermer les informations" onClick={() => setMobileDetails(false)}><X size={17}/></button></div>
       <div className="details-body"><div className="security-card"><span className="security-icon"><LockKeyhole size={21}/></span>
         <strong>Chiffrement de bout en bout</strong><p>Les messages sont chiffrés dans ton navigateur avec MLS. Les fichiers sont chiffrés avant le téléversement.</p></div>
         <div className="detail-row"><Paperclip size={17}/><div><strong>Pièces jointes</strong><small>1 000 Kio par fichier</small></div></div>
         <div className="detail-row"><ShieldCheck size={17}/><div><strong>Clés du navigateur</strong><small>Conserve les données du site pour retrouver tes conversations.</small></div></div>
       </div>
-    </aside>
+    </aside>}
     <dialog ref={modal} className="dialog" aria-labelledby="dialog-title" onCancel={event => { event.preventDefault(); if (!busy) setDialog(undefined) }}>
       {dialog && <><div className="dialog-top"><h2 id="dialog-title">{dialogs[dialog].title}</h2><button className="icon" aria-label="Fermer" disabled={busy} onClick={() => setDialog(undefined)}><X size={20}/></button></div>
         <form key={dialog} onSubmit={submit}>
@@ -392,5 +483,12 @@ function Chat({ account, navigate, onProfile, onLogout }: {
     </dialog>
   </div>
 }
+function FriendIdentity({ name, user, online }: { name: string; user: string; online?: boolean }) {
+  return <div className="friend-identity">
+    <span className="avatar">{initials(name)}{online !== undefined && <i className={online ? 'online' : ''} role="img" aria-label={online ? 'En ligne' : 'Hors ligne'}/>}</span>
+    <div><strong>{name}</strong><small>@{user}</small></div>
+  </div>
+}
+
 function initials(name: string) { return name.trim().slice(0, 2).toLocaleUpperCase() || '?' }
 createRoot(document.getElementById('root')!).render(<App/>)
