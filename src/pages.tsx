@@ -50,7 +50,7 @@ export function HomePage({ navigate }: { navigate: Navigate }) {
       <section className="landing-features" aria-label="Fonctionnalités">
         <div><Users size={22}/><h2>Communautés</h2><p>Regroupe tes salons et invite tes membres dans ta communauté.</p></div>
         <div><MessageSquare size={22}/><h2>Messages privés</h2><p>Échange des messages et des fichiers chiffrés depuis ton navigateur.</p></div>
-        <div><Server size={22}/><h2>Ton compte Sillage</h2><p>Choisis un pseudo et retrouve tes conversations dans ton navigateur.</p></div>
+        <div><Server size={22}/><h2>Ton compte Sillage</h2><p>Choisis un pseudo et retrouve tes conversations sur tes appareils.</p></div>
       </section>
     </main>
   </div>
@@ -97,7 +97,7 @@ export function AccountPage({ navigate, register, connected, notice, onAuthentic
             <form onSubmit={submit}>
               <Field name="value" label="Pseudo" placeholder="alice" autoComplete="username" disabled={busy} minLength={3} maxLength={31}/>
               <Field name="password" label="Mot de passe" type="password" autoComplete={register ? 'new-password' : 'current-password'} disabled={busy} minLength={12} maxLength={256}/>
-              {register && <small className="field-hint">12 caractères minimum. Garde ce navigateur pour retrouver tes clés.</small>}
+              {register && <small className="field-hint">12 caractères minimum. Garde ce mot de passe pour retrouver tes conversations.</small>}
               {error && <p className="account-error" role="alert">{error}</p>}
               <button className="primary" disabled={busy}>{busy ? 'Connexion au serveur…' : register ? 'Créer mon compte' : 'Se connecter'}</button>
             </form>
@@ -109,9 +109,9 @@ export function AccountPage({ navigate, register, connected, notice, onAuthentic
         <ol>
           <li><div><strong>Choisis « Inscription »</strong><p>Entre un pseudo, par exemple <code>alice_27</code>. Les autres membres pourront t’envoyer une demande d’ami avec ce pseudo.</p></div></li>
           <li><div><strong>Crée ton mot de passe</strong><p>Utilise au moins 12 caractères, puis clique sur « Créer mon compte ». Dans la messagerie, ajoute un ami par son pseudo et attends qu’il accepte avant de lui écrire.</p></div></li>
-          <li><div><strong>Reviens avec le même navigateur</strong><p>Les clés qui ouvrent tes conversations restent sur cet appareil. Évite la navigation privée et conserve les données du site.</p></div></li>
+          <li><div><strong>Connecte tes autres appareils</strong><p>Ouvre la même adresse de Sillage sur ton téléphone ou ton PC. Utilise ton pseudo et le même mot de passe pour déverrouiller ta sauvegarde chiffrée.</p></div></li>
         </ol>
-        <details><summary>Je change de navigateur ou d’appareil</summary><p>Ce prototype associe un compte à un seul navigateur. Il ne permet pas de déplacer les clés ni de récupérer les conversations après effacement des données locales.</p></details>
+        <details><summary>Mon compte existait avant la synchronisation</summary><p>Après la mise à jour, reconnecte-toi une fois dans ton navigateur d’origine pour sauvegarder ses clés. Tu pourras ensuite te connecter sur tes autres appareils.</p></details>
       </aside>
     </main>
   </div>

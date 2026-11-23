@@ -4,7 +4,9 @@ export type Room = { id: string; name: string; kind: 'channel' | 'direct'; space
 export type EventRecord = { id: string; seq: number; sender: string; at: number; data: string }
 export type PackageRecord = { id: string; data: string }
 export type Friendship = { sender: string; recipient: string; status: 'pending' | 'accepted' | 'declined' }
-export type Directory = { accounts: Account[]; spaces: Space[]; rooms: Room[]; packages: number; friendships: Friendship[]; onlineFriends: string[] }
+export type MessageRequest = Friendship & { space: string; spaceName: string }
+export type CommunityInvite = { id: string; space: string; name: string; sender: string }
+export type Directory = { accounts: Account[]; spaces: Space[]; rooms: Room[]; packages: number; friendships: Friendship[]; onlineFriends: string[]; messageRequests: MessageRequest[]; communityInvites: CommunityInvite[] }
 export type Payload =
   | { kind: 'text'; from: string; text: string }
   | { kind: 'file'; from: string; name: string; id: string; key: string; iv: string; size: number }

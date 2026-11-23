@@ -211,3 +211,9 @@ small { font-size:12px;color:var(--muted); }
 
 .return-friends { display: none; }
 @media (max-width: 620px) { .return-friends { display: inline-grid; } }
+
+.side-invite {display:grid;gap:3px;margin:4px 3px 8px;padding:8px;background:#252335;border-radius:8px;overflow-wrap:anywhere;font-size:13px;}
+.side-invite > div,.community-actions {display:flex;align-items:center;flex-wrap:wrap;gap:6px;}
+.side-invite .secondary {padding:5px 7px;font-size:12px;}
+.community-tools {display:grid;gap:8px;}
+.community-tools .friend-row .secondary {padding:6px 8px;font-size:12px;}

@@ -8,7 +8,8 @@ import { defaultClientConfig } from 'ts-mls/clientConfig.js'
 import { verifyKeyPackage } from 'ts-mls/keyPackage.js'
 import { getGroupMembers } from 'ts-mls/clientState.js'
 import { ApiError, post, request } from './api'
-import { lock, readLocal, writeLocal } from './storage'
+import { legacyRooms, lock, readLocal, writeLocal } from './storage'
+import { deriveVaultKey, keepVaultKey, withVault, type Vault } from './vault'
 import type { Account, EventRecord, Message, PackageRecord, Payload, Room } from './types'
 
 export const maxAttachment = 1000 * 1024
@@ -29,6 +30,15 @@ type LocalRoom = {
   seq: number
   messages: Message[]
   pending?: Pending
+}
+function recentMessages(messages: Message[]) {
+  let bytes = 0
+  const first = Math.max(0, messages.length - 500)
+  for (let index = messages.length - 1; index >= first; index--) {
+    bytes += encoder.encode(JSON.stringify(messages[index])).length
+    if (bytes > 768 * 1024) return messages.slice(index + 1)
+  }
+  return messages.slice(first)
 }
 type PayloadInput = Omit<Extract<Payload, { kind: 'text' }>, 'from'> | Omit<Extract<Payload, { kind: 'file' }>, 'from'>
 
@@ -65,56 +75,84 @@ function decodeWire(data: string) {
   return decoded[0]
 }
 
-export async function authenticate(user: string, password: string, register: boolean) {
-  return lock(user, async () => {
-    const proof = await passwordProof(user, password)
-    if (!register) {
-      const account = await post<Account>('login', { user, proof })
-      try { await loadIdentity(account) } catch (error) {
-        await post('logout', {}).catch(() => {})
-        throw error
-      }
-      return account
-    }
-    let identity = await readLocal<Identity>('identity:' + user)
-    if (!identity) {
-      const cs = await suite()
-      identity = { ...await cs.signature.keygen(), packages: [], pins: {} }
-      identity.packages = await Promise.all(Array.from({ length: 8 }, () => makePackage(user, identity!)))
-      await writeLocal('identity:' + user, identity)
-    }
-    return post<Account>('signup', { user, proof, identity: b64(identity.publicKey), packages: identity.packages.slice(-8).map(publicPackage) })
-  })
-}
-
-export async function loadIdentity(account: Account) {
-  const identity = await readLocal<Identity>('identity:' + account.id)
+function verifiedIdentity(account: Account, identity: Identity | undefined) {
   if (!identity || b64(identity.publicKey) !== account.identity) {
-    throw new Error('Les clés de ce compte se trouvent dans son navigateur d’origine. Ouvre Sillage dans ce navigateur.')
+    throw new Error('Sauvegarde absente. Connecte-toi une fois dans ton navigateur d’origine pour transférer les clés existantes.')
   }
   return identity
 }
 
-export async function replenish(account: Account, current: number) {
-  if (current >= 3) return
-  await lock(account.id, async () => {
-    const count = (await request<{ packages: number }>('directory')).packages
-    if (count >= 3) return
-    const identity = await loadIdentity(account)
-    const next = await Promise.all(Array.from({ length: 8 }, () => makePackage(account.id, identity)))
-    // Keep expired packages: a member can first open a previously delivered Welcome much later.
-    identity.packages = [...identity.packages, ...next]
-    await writeLocal('identity:' + account.id, identity)
-    await post('packages', { packages: next.map(publicPackage) })
+export async function authenticate(user: string, password: string, register: boolean) {
+  return lock(user, async () => {
+    const [proof, key] = await Promise.all([passwordProof(user, password), deriveVaultKey(user, password)])
+    const localName = 'identity:' + user
+    let identity = await readLocal<Identity>(localName)
+    if (register && !identity) {
+      const cs = await suite()
+      identity = { ...await cs.signature.keygen(), packages: [], pins: {} }
+      const created = identity
+      created.packages = await Promise.all(Array.from({ length: 8 }, () => makePackage(user, created)))
+      await writeLocal(localName, created)
+    }
+    const account = register && identity
+      ? await post<Account>('signup', { user, proof, identity: b64(identity.publicKey), packages: identity.packages.slice(-8).map(publicPackage) })
+      : await post<Account>('login', { user, proof })
+    try {
+      // Upload the legacy identity last, so an interrupted migration can safely restart.
+      await withVault(user, async vault => {
+        const saved = await vault.read<Identity>('identity')
+        if (saved) { verifiedIdentity(account, saved); return }
+        if (await readLocal<boolean>('vault-migrated:' + user)) throw new Error('La sauvegarde du compte est introuvable sur ce service.')
+        const legacy = verifiedIdentity(account, identity)
+        for (const name of await legacyRooms(user)) {
+          const room = await readLocal<LocalRoom>(name)
+          if (room) {
+            const roomId = name.slice(('room:' + user + ':').length)
+            await vault.write('room-' + roomId, { ...room, messages: recentMessages(room.messages) })
+          }
+        }
+        await vault.write('identity', legacy)
+      }, key)
+      await keepVaultKey(user, key)
+      await writeLocal('vault-migrated:' + user, true)
+      return account
+    } catch (error) {
+      await post('logout', {}).catch(() => {})
+      throw error
+    }
   })
 }
 
-async function config(account: Account, identity: Identity, directory: Account[]) {
+async function vaultIdentity(account: Account, vault: Vault) {
+  return verifiedIdentity(account, await vault.read<Identity>('identity'))
+}
+
+export async function loadIdentity(account: Account) {
+  return withVault(account.id, vault => vaultIdentity(account, vault))
+}
+
+export async function replenish(account: Account, current: number) {
+  if (current >= 3) return
+  await withVault(account.id, async vault => {
+    const count = (await request<{ packages: number }>('directory')).packages
+    if (count >= 3) return
+    const identity = await vaultIdentity(account, vault)
+    const next = await Promise.all(Array.from({ length: 8 }, () => makePackage(account.id, identity)))
+    // Keep expired packages: a member can first open a previously delivered Welcome much later.
+    identity.packages = [...identity.packages, ...next]
+    await vault.write('identity', identity)
+    await vault.post('packages', { packages: next.map(publicPackage) })
+  })
+}
+
+async function config(account: Account, identity: Identity, directory: Account[], vault: Vault) {
+  let changed = false
   for (const contact of directory) {
     if (Object.hasOwn(identity.pins, contact.id)) continue
+    changed = true
     Object.defineProperty(identity.pins, contact.id, { value: contact.identity, enumerable: true, writable: true, configurable: true })
   }
-  await writeLocal('identity:' + account.id, identity)
+  if (changed) await vault.write('identity', identity)
   return {
     ...defaultClientConfig,
     authService: {
@@ -136,24 +174,24 @@ function deserialize(record: LocalRoom, clientConfig: ClientState['clientConfig'
 function checkGroup(state: GroupState, room: string) {
   if (decoder.decode(state.groupContext.groupId) !== room) throw new Error('Le groupe ne correspond pas à ce salon.')
 }
-function keyFor(account: Account, room: string) { return 'room:' + account.id + ':' + room }
+function keyFor(room: string) { return 'room-' + room }
 function routes(room: string, endpoint: string) { return 'rooms/' + room + '/' + endpoint }
 
 export async function createRoom(account: Account, name: string, kind: Room['kind'], space: string | null, directory: Account[]) {
-  return lock(account.id, async () => {
-    const identity = await loadIdentity(account)
+  return withVault(account.id, async vault => {
+    const identity = await vaultIdentity(account, vault)
     const id = crypto.randomUUID()
     const keys = await makePackage(account.id, identity)
-    const state = await createGroup(encoder.encode(id), keys.publicPackage, keys.privatePackage, [], await suite(), await config(account, identity, directory))
-    await writeLocal<LocalRoom>(keyFor(account, id), { state: encodeGroupState(state), seq: 0, messages: [] })
-    await post('rooms', { id, name, kind, space })
+    const state = await createGroup(encoder.encode(id), keys.publicPackage, keys.privatePackage, [], await suite(), await config(account, identity, directory, vault))
+    await vault.write<LocalRoom>(keyFor(id), { state: encodeGroupState(state), seq: 0, messages: [] })
+    await vault.post('rooms', { id, name, kind, space })
     return { id, name, kind, space, owner: account.id, members: 1, joined: 0, welcome: null, packageId: null } satisfies Room
   })
 }
 
-async function loadRoom(account: Account, room: Room, identity: Identity, clientConfig: ClientState['clientConfig']) {
-  const key = keyFor(account, room.id)
-  const existing = await readLocal<LocalRoom>(key)
+async function loadRoom(room: Room, identity: Identity, clientConfig: ClientState['clientConfig'], vault: Vault) {
+  const key = keyFor(room.id)
+  const existing = await vault.read<LocalRoom>(key)
   if (existing) return existing
   const pack = identity.packages.find(p => p.id === room.packageId)
   if (!pack || !room.welcome) throw new Error('La clé de ce salon est indisponible dans ce navigateur.')
@@ -166,35 +204,34 @@ async function loadRoom(account: Account, room: Room, identity: Identity, client
     throw new Error('L’identité du créateur manque dans cette invitation.')
   }
   const record = { state: encodeGroupState(state), seq: room.joined, messages: [] }
-  await writeLocal(key, record)
-  const stored = (await readLocal<Identity>('identity:' + account.id))!
-  stored.packages = stored.packages.filter(p => p.id !== pack.id)
-  await writeLocal('identity:' + account.id, stored)
+  await vault.write(key, record)
+  identity.packages = identity.packages.filter(p => p.id !== pack.id)
+  await vault.write('identity', identity)
   return record
 }
 
-async function flush(account: Account, room: Room, record: LocalRoom): Promise<LocalRoom> {
+async function flush(account: Account, room: Room, record: LocalRoom, vault: Vault): Promise<LocalRoom> {
   if (!record.pending) return record
   const pending = record.pending
   let next: LocalRoom
   try {
-    const event = await post<EventRecord>(routes(room.id, pending.kind), {
+    const event = await vault.post<EventRecord>(routes(room.id, pending.kind), {
       id: pending.id, after: pending.after, data: pending.data, ...pending.target,
     })
     if (event.seq !== record.seq + 1 || event.sender !== account.id || event.id !== pending.id || event.data !== pending.data) {
       throw new Error('Le serveur a retourné un accusé de réception incohérent.')
     }
     next = { state: pending.state, seq: event.seq, messages: pending.payload
-      ? [...record.messages, { id: event.id, at: event.at, payload: pending.payload }].slice(-500) : record.messages }
+      ? recentMessages([...record.messages, { id: event.id, at: event.at, payload: pending.payload }]) : record.messages }
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 409) throw error
     const events = await request<EventRecord[]>(routes(room.id, 'events?after=' + record.seq))
     if (events.some(event => event.id === pending.id)) throw new Error('L’accusé de réception du message doit être resynchronisé.')
     next = { ...record, state: pending.kind === 'events' ? pending.state : record.state, pending: undefined }
-    await writeLocal(keyFor(account, room.id), next)
+    await vault.write(keyFor(room.id), next)
     throw error
   }
-  await writeLocal(keyFor(account, room.id), next)
+  await vault.write(keyFor(room.id), next)
   return next
 }
 
@@ -202,7 +239,7 @@ function signedBytes(room: string, id: string, payload: string) {
   return encoder.encode(JSON.stringify(['sillage-message-v1', room, id, payload]))
 }
 
-async function applyEvents(account: Account, room: Room, record: LocalRoom, identity: Identity, clientConfig: ClientState['clientConfig']) {
+async function applyEvents(account: Account, room: Room, record: LocalRoom, identity: Identity, clientConfig: ClientState['clientConfig'], vault: Vault) {
   const cs = await suite()
   let state = deserialize(record, clientConfig)
   checkGroup(state, room.id)
@@ -242,20 +279,20 @@ async function applyEvents(account: Account, room: Room, record: LocalRoom, iden
       for (const bytes of result.consumed) zeroOutUint8Array(bytes)
       seq = event.seq
     }
-    if (events.length) await writeLocal<LocalRoom>(keyFor(account, room.id), { state: encodeGroupState(state), seq, messages: messages.slice(-500) })
+    if (events.length) await vault.write<LocalRoom>(keyFor(room.id), { state: encodeGroupState(state), seq, messages: recentMessages(messages) })
     if (events.length < 100) break
   }
-  return { state: encodeGroupState(state), seq, messages: messages.slice(-500) }
+  return { state: encodeGroupState(state), seq, messages: recentMessages(messages) }
 }
 
-async function withRoom<T>(account: Account, room: Room, directory: Account[], action: (record: LocalRoom, identity: Identity, state: ClientState) => Promise<T>) {
-  return lock(account.id, async () => {
-    const identity = await loadIdentity(account)
-    const clientConfig = await config(account, identity, directory)
-    let record = await loadRoom(account, room, identity, clientConfig)
-    record = await flush(account, room, record)
-    record = await applyEvents(account, room, record, identity, clientConfig)
-    return action(record, identity, deserialize(record, clientConfig))
+async function withRoom<T>(account: Account, room: Room, directory: Account[], action: (record: LocalRoom, identity: Identity, state: ClientState, vault: Vault) => Promise<T>) {
+  return withVault(account.id, async vault => {
+    const identity = await vaultIdentity(account, vault)
+    const clientConfig = await config(account, identity, directory, vault)
+    let record = await loadRoom(room, identity, clientConfig, vault)
+    record = await flush(account, room, record, vault)
+    record = await applyEvents(account, room, record, identity, clientConfig, vault)
+    return action(record, identity, deserialize(record, clientConfig), vault)
   })
 }
 
@@ -264,11 +301,11 @@ export function readMessages(account: Account, room: Room, directory: Account[])
 }
 
 export function addMember(account: Account, room: Room, target: Account, directory: Account[]) {
-  return withRoom(account, room, directory, async (record, identity, state) => {
+  return withRoom(account, room, directory, async (record, identity, state, vault) => {
     if (room.owner !== account.id) throw new Error('Seul le créateur du salon peut inviter.')
     const pinned = Object.hasOwn(identity.pins, target.id) ? identity.pins[target.id] : ''
     if (pinned !== target.identity) throw new Error('La clé connue de cette personne a changé.')
-    const pack = await request<PackageRecord>('packages/' + target.id)
+    const pack = await request<PackageRecord>('packages/' + target.id + (room.space ? '?space=' + room.space : ''))
     const wire = decodeWire(pack.data)
     const cs = await suite()
     if (wire.wireformat !== 'mls_key_package' || wire.keyPackage.leafNode.credential.credentialType !== 'basic' ||
@@ -287,13 +324,13 @@ export function addMember(account: Account, room: Room, target: Account, directo
     }
     for (const bytes of result.consumed) zeroOutUint8Array(bytes)
     const next = { ...record, pending }
-    await writeLocal(keyFor(account, room.id), next)
-    await flush(account, room, next)
+    await vault.write(keyFor(room.id), next)
+    await flush(account, room, next, vault)
   })
 }
 
 export function sendMessage(account: Account, room: Room, body: PayloadInput, directory: Account[]) {
-  return withRoom(account, room, directory, async (record, identity, state) => {
+  return withRoom(account, room, directory, async (record, identity, state, vault) => {
     const cs = await suite()
     const id = crypto.randomUUID()
     const payload = { ...body, from: account.id } satisfies Payload
@@ -306,8 +343,8 @@ export function sendMessage(account: Account, room: Room, body: PayloadInput, di
       state: encodeGroupState(result.newState),
     } }
     for (const bytes of result.consumed) zeroOutUint8Array(bytes)
-    await writeLocal(keyFor(account, room.id), next)
-    return (await flush(account, room, next)).messages
+    await vault.write(keyFor(room.id), next)
+    return (await flush(account, room, next, vault)).messages
   })
 }
 
